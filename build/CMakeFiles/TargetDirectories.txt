@@ -1,0 +1,4 @@
+/home/ubuntu/vnet/StreamCounter/build/CMakeFiles/usb_enum.dir
+/home/ubuntu/vnet/StreamCounter/build/CMakeFiles/camera_capture.dir
+/home/ubuntu/vnet/StreamCounter/build/CMakeFiles/edit_cache.dir
+/home/ubuntu/vnet/StreamCounter/build/CMakeFiles/rebuild_cache.dir

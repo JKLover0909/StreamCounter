@@ -17,7 +17,8 @@
 #include <fcntl.h>
 #include <thread>
 #include <atomic>
-
+#include <opencv2/opencv.hpp>
+#include <opencv2/dnn.hpp>
 // Link with SetupAPI, Cfgmgr32, and Media Foundation
 #pragma comment(lib, "SetupAPI.lib")
 #pragma comment(lib, "Cfgmgr32.lib")

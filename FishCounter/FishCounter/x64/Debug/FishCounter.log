@@ -1,1 +1,5 @@
-﻿  FishCounter.vcxproj -> C:\Users\sonng\source\repos\FishCounter\x64\Debug\FishCounter.exe
+﻿  main.cpp
+C:\Users\sonng\Code\StreamCounter\FishCounter\main.cpp(217,19): warning C4244: 'initializing': conversion from 'double' to 'int', possible loss of data
+C:\Users\sonng\Code\StreamCounter\FishCounter\main.cpp(218,19): warning C4244: 'initializing': conversion from 'double' to 'int', possible loss of data
+C:\Users\sonng\Code\StreamCounter\FishCounter\main.cpp(219,19): warning C4244: 'initializing': conversion from 'double' to 'int', possible loss of data
+  FishCounter.vcxproj -> C:\Users\sonng\Code\StreamCounter\FishCounter\x64\Debug\FishCounter.exe

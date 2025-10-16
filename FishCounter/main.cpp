@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <thread>
 #include <atomic>
+#include <fstream>
 #include <opencv2/opencv.hpp>
 #include <opencv2/dnn.hpp>
 // Link with SetupAPI, Cfgmgr32, and Media Foundation
@@ -47,6 +48,21 @@ struct LivestreamContext {
 };
 
 LivestreamContext g_livestreamCtx;
+
+// Global variables cho YOLO inference
+struct YOLOConfig {
+    cv::dnn::Net net;
+    std::vector<std::string> classNames;
+    int inputSize = 640;
+    float confThreshold = 0.5f;
+    float nmsThreshold = 0.45f;
+    bool isLoaded = false;
+};
+
+YOLOConfig g_yoloConfig;
+std::atomic<int> g_personCount{ 0 };
+std::atomic<int> g_frameCounter{ 0 };
+const int g_inferenceSkipFrames = 3; // Chạy inference mỗi 3 frame
 
 // Thiết lập console để hiển thị Unicode
 void SetupConsole()
@@ -197,39 +213,146 @@ bool IsTargetCamera(const std::wstring& symbolicLink, const std::wstring& target
 }
 
 // Chuyển đổi NV12 sang RGB24
-void ConvertNV12ToRGB24(const BYTE* nv12Data, BYTE* rgbData, UINT32 width, UINT32 height)
+// Tải model YOLO và class names
+bool LoadModel(const std::string& modelPath, const std::string& classNamesPath)
 {
-    const BYTE* yPlane = nv12Data;
-    const BYTE* uvPlane = nv12Data + (width * height);
-
-    for (UINT32 y = 0; y < height; y++)
+    try
     {
-        for (UINT32 x = 0; x < width; x++)
+        wprintf(L"[YOLO] Dang tai model: %hs\n", modelPath.c_str());
+        g_yoloConfig.net = cv::dnn::readNetFromONNX(modelPath);
+        
+        if (g_yoloConfig.net.empty())
         {
-            int yIndex = y * width + x;
-            int uvIndex = (y / 2) * width + (x & ~1);
-
-            int Y = yPlane[yIndex];
-            int U = uvPlane[uvIndex] - 128;
-            int V = uvPlane[uvIndex + 1] - 128;
-
-            // YUV to RGB conversion
-            int R = Y + (1.370705 * V);
-            int G = Y - (0.337633 * U) - (0.698001 * V);
-            int B = Y + (1.732446 * U);
-
-            // Clamp values to 0-255
-            R = (R < 0) ? 0 : (R > 255 ? 255 : R);
-            G = (G < 0) ? 0 : (G > 255 ? 255 : G);
-            B = (B < 0) ? 0 : (B > 255 ? 255 : B);
-
-            // BGR format for Windows DIB
-            int rgbIndex = (height - 1 - y) * width * 3 + x * 3;
-            rgbData[rgbIndex + 0] = (BYTE)B;
-            rgbData[rgbIndex + 1] = (BYTE)G;
-            rgbData[rgbIndex + 2] = (BYTE)R;
+            wprintf(L"[YOLO] Loi: Khong the tai model!\n");
+            return false;
         }
+
+        // Cau hinh backend (CPU by default, CUDA neu co)
+        g_yoloConfig.net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+        g_yoloConfig.net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+        // Neu co GPU: g_yoloConfig.net.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
+        // g_yoloConfig.net.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA);
+
+        wprintf(L"[YOLO] Da tai model thanh cong!\n");
+
+        // Tai class names
+        std::ifstream ifs(classNamesPath);
+        if (!ifs.is_open())
+        {
+            wprintf(L"[YOLO] Loi: Khong the mo file class names: %hs\n", classNamesPath.c_str());
+            return false;
+        }
+
+        std::string line;
+        while (std::getline(ifs, line))
+        {
+            if (!line.empty())
+                g_yoloConfig.classNames.push_back(line);
+        }
+        ifs.close();
+
+        wprintf(L"[YOLO] Da tai %zu class names\n", g_yoloConfig.classNames.size());
+        g_yoloConfig.isLoaded = true;
+
+        return true;
     }
+    catch (const std::exception& e)
+    {
+        wprintf(L"[YOLO] Exception: %hs\n", e.what());
+        return false;
+    }
+}
+
+// Inference va dem nguoi
+int RunInferenceAndCountPeople(cv::Mat& frame)
+{
+    if (!g_yoloConfig.isLoaded)
+        return 0;
+
+    try
+    {
+        // Resize va tao blob
+        cv::Mat blob = cv::dnn::blobFromImage(
+            frame,
+            1.0 / 255.0,
+            cv::Size(g_yoloConfig.inputSize, g_yoloConfig.inputSize),
+            cv::Scalar(0, 0, 0),
+            true,
+            false
+        );
+
+        g_yoloConfig.net.setInput(blob);
+
+        // Forward
+        std::vector<cv::Mat> outputs;
+        std::vector<std::string> outNames = g_yoloConfig.net.getUnconnectedOutLayersNames();
+        g_yoloConfig.net.forward(outputs, outNames);
+
+        // Parse outputs
+        std::vector<int> classIds;
+        std::vector<float> confidences;
+        std::vector<cv::Rect> boxes;
+
+        float scaleX = (float)frame.cols / g_yoloConfig.inputSize;
+        float scaleY = (float)frame.rows / g_yoloConfig.inputSize;
+
+        for (const auto& output : outputs)
+        {
+            const float* data = (float*)output.data;
+            int rows = output.rows;
+            int cols = output.cols;
+
+            for (int i = 0; i < rows; ++i)
+            {
+                cv::Mat scores = output.row(i).colRange(4, output.cols);
+                cv::Point classIdPoint;
+                double confidence;
+                minMaxLoc(scores, nullptr, &confidence, nullptr, &classIdPoint);
+
+                if (confidence > g_yoloConfig.confThreshold)
+                {
+                    int centerX = (int)(data[i * cols + 0] * scaleX);
+                    int centerY = (int)(data[i * cols + 1] * scaleY);
+                    int width = (int)(data[i * cols + 2] * scaleX);
+                    int height = (int)(data[i * cols + 3] * scaleY);
+                    int left = centerX - width / 2;
+                    int top = centerY - height / 2;
+
+                    classIds.push_back(classIdPoint.x);
+                    confidences.push_back((float)confidence);
+                    boxes.push_back(cv::Rect(left, top, width, height));
+                }
+            }
+        }
+
+        // NMS
+        std::vector<int> indices;
+        cv::dnn::NMSBoxes(boxes, confidences, g_yoloConfig.confThreshold, g_yoloConfig.nmsThreshold, indices);
+
+        // Dem nguoi (class 0)
+        int personCount = 0;
+        for (int idx : indices)
+        {
+            if (classIds[idx] == 0) // class 0 = person
+            {
+                personCount++;
+            }
+        }
+
+        return personCount;
+    }
+    catch (const std::exception& e)
+    {
+        wprintf(L"[YOLO] Inference error: %hs\n", e.what());
+        return 0;
+    }
+}
+
+// Helper function: Convert NV12 to BGR using OpenCV (for fallback if RGB24 fails)
+void ConvertNV12ToBGR(const BYTE* nv12Data, cv::Mat& bgrFrame, UINT32 width, UINT32 height)
+{
+    cv::Mat nv12(height + height / 2, width, CV_8UC1, (BYTE*)nv12Data);
+    cv::cvtColor(nv12, bgrFrame, cv::COLOR_YUV2BGR_NV12);
 }
 
 // Window procedure để xử lý sự kiện
@@ -279,6 +402,10 @@ void CaptureThread()
 {
     wprintf(L"[Thread] Bat dau capture thread...\n");
 
+    cv::Mat displayFrame;
+    static int frameCount = 0;
+    static bool firstFrame = true;
+
     while (g_livestreamCtx.isRunning)
     {
         DWORD streamIndex = 0;
@@ -309,35 +436,113 @@ void CaptureThread()
 
                 if (SUCCEEDED(hr))
                 {
-                    EnterCriticalSection(&g_livestreamCtx.cs);
+                    frameCount++;
+                    
+                    // Log chi tiet lan dau
+                    if (firstFrame)
+                    {
+                        wprintf(L"[Thread] LAM DAU NHAN FRAME:\n");
+                        wprintf(L"  - Data length: %u bytes\n", dataLength);
+                        wprintf(L"  - NV12 size: %u bytes (width:%u * height:%u * 1.5)\n", 
+                            g_livestreamCtx.videoWidth * g_livestreamCtx.videoHeight * 3 / 2,
+                            g_livestreamCtx.videoWidth, g_livestreamCtx.videoHeight);
+                        wprintf(L"  - Frame count: %d\n", frameCount);
+                        
+                        // Detect format: neu data length ~ height*width*1.5 thi NV12
+                        UINT32 nv12Size = g_livestreamCtx.videoWidth * g_livestreamCtx.videoHeight * 3 / 2;
+                        if (abs((int)dataLength - (int)nv12Size) < 1024)
+                        {
+                            wprintf(L"  - FORMAT: NV12 (camera return NV12, khong phai RGB24!)\n");
+                        }
+                        firstFrame = false;
+                    }
 
-                    // Chuyển đổi NV12 sang RGB24
-                    ConvertNV12ToRGB24(pData, g_livestreamCtx.frameBuffer.data(),
-                        g_livestreamCtx.videoWidth, g_livestreamCtx.videoHeight);
-
-                    LeaveCriticalSection(&g_livestreamCtx.cs);
+                    // CONVERT NV12 -> BGR
+                    cv::Mat nv12(g_livestreamCtx.videoHeight + g_livestreamCtx.videoHeight / 2, 
+                                 g_livestreamCtx.videoWidth, CV_8UC1, pData);
+                    cv::Mat bgrFrame;
+                    cv::cvtColor(nv12, bgrFrame, cv::COLOR_YUV2BGR_NV12);
+                    displayFrame = bgrFrame;
 
                     pBuffer->Unlock();
 
-                    // Cập nhật cửa sổ
+                    // Inference moi N frame
+                    int currentFrame = g_frameCounter.fetch_add(1);
+                    if (currentFrame % g_inferenceSkipFrames == 0 && g_yoloConfig.isLoaded)
+                    {
+                        int personCount = RunInferenceAndCountPeople(displayFrame);
+                        g_personCount.store(personCount);
+                        
+                        if (currentFrame % 30 == 0)
+                        {
+                            wprintf(L"[Thread] Inference: %d people detected\n", personCount);
+                        }
+                    }
+
+                    int personCount = g_personCount.load();
+
+                    // Ve overlay
+                    cv::Rect overlayRect(10, 10, 200, 50);
+                    cv::Mat overlay = displayFrame.clone();
+                    cv::rectangle(overlay, overlayRect, cv::Scalar(0, 0, 0), -1);
+                    cv::addWeighted(overlay, 0.6, displayFrame, 0.4, 0, displayFrame);
+
+                    std::string countText = "People: " + std::to_string(personCount);
+                    cv::putText(displayFrame, countText, cv::Point(20, 45),
+                        cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(0, 255, 255), 2);
+
+                    // Convert BGR -> RGB24 de copy vao frameBuffer
+                    cv::Mat rgbFrame;
+                    cv::cvtColor(displayFrame, rgbFrame, cv::COLOR_BGR2RGB);
+
+                    // Copy vao frameBuffer
+                    EnterCriticalSection(&g_livestreamCtx.cs);
+
+                    int stride = (g_livestreamCtx.videoWidth * 3 + 3) & ~3;
+
+                    if (g_livestreamCtx.frameBuffer.size() >= stride * g_livestreamCtx.videoHeight)
+                    {
+                        for (UINT32 y = 0; y < g_livestreamCtx.videoHeight; y++)
+                        {
+                            BYTE* srcRow = rgbFrame.data + y * rgbFrame.step;
+                            BYTE* dstRow = g_livestreamCtx.frameBuffer.data() + y * stride;
+                            memcpy(dstRow, srcRow, g_livestreamCtx.videoWidth * 3);
+                        }
+                        
+                        if (frameCount % 30 == 0)
+                        {
+                            wprintf(L"[Thread] Frame #%d copied to buffer\n", frameCount);
+                        }
+                    }
+
+                    LeaveCriticalSection(&g_livestreamCtx.cs);
+
                     InvalidateRect(g_livestreamCtx.hwnd, nullptr, FALSE);
+                }
+                else
+                {
+                    wprintf(L"[Thread] ERROR: Lock buffer failed: 0x%08X\n", hr);
                 }
 
                 pBuffer->Release();
+            }
+            else
+            {
+                wprintf(L"[Thread] ERROR: ConvertToContiguousBuffer failed: 0x%08X\n", hr);
             }
 
             pSample->Release();
         }
         else if (flags & MF_SOURCE_READERF_ERROR)
         {
-            wprintf(L"[Thread] Loi khi doc frame\n");
+            wprintf(L"[Thread] ERROR: ReadSample error\n");
             break;
         }
 
-        Sleep(33); // ~30 FPS
+        Sleep(33);
     }
 
-    wprintf(L"[Thread] Ket thuc capture thread\n");
+    wprintf(L"[Thread] Ket thuc. Tong frame: %d\n", frameCount);
 }
 
 // Hiển thị livestream
@@ -403,17 +608,18 @@ HRESULT ShowLivestream(IMFActivate* pActivate)
         wprintf(L"Kich thuoc video: %dx%d\n", g_livestreamCtx.videoWidth, g_livestreamCtx.videoHeight);
     }
 
-    // Khởi tạo bitmap info
+    // Khởi tạo bitmap info (top-down DIB: biHeight phải âm)
     ZeroMemory(&g_livestreamCtx.bitmapInfo, sizeof(BITMAPINFO));
     g_livestreamCtx.bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    g_livestreamCtx.bitmapInfo.bmiHeader.biWidth = g_livestreamCtx.videoWidth;
-    g_livestreamCtx.bitmapInfo.bmiHeader.biHeight = g_livestreamCtx.videoHeight;
+    g_livestreamCtx.bitmapInfo.bmiHeader.biWidth = (LONG)g_livestreamCtx.videoWidth;
+    g_livestreamCtx.bitmapInfo.bmiHeader.biHeight = -((LONG)g_livestreamCtx.videoHeight);  // Âm = top-down (không đảo)
     g_livestreamCtx.bitmapInfo.bmiHeader.biPlanes = 1;
     g_livestreamCtx.bitmapInfo.bmiHeader.biBitCount = 24;
     g_livestreamCtx.bitmapInfo.bmiHeader.biCompression = BI_RGB;
 
-    // Cấp phát buffer cho frame
-    g_livestreamCtx.frameBuffer.resize(g_livestreamCtx.videoWidth * g_livestreamCtx.videoHeight * 3);
+    // Cấp phát buffer cho frame (align stride to 4 bytes)
+    int stride = (g_livestreamCtx.videoWidth * 3 + 3) & ~3;
+    g_livestreamCtx.frameBuffer.resize(stride * g_livestreamCtx.videoHeight);
 
     g_livestreamCtx.pReader = pReader;
     InitializeCriticalSection(&g_livestreamCtx.cs);
@@ -515,6 +721,38 @@ int wmain()
     }
 
     wprintf(L"[OK] Da khoi tao Media Foundation thanh cong\n");
+
+    // Tai model YOLO (tim file relative voi executable hoac absolute)
+    wprintf(L"\n[*] Dang tai model YOLO...\n");
+    
+    // Cac duong dan co the (theo thu tu uu tien)
+    std::vector<std::string> modelPaths = {
+        "AIStuff/yolov8n.onnx",           // Relative: executable/../AIStuff
+        "../AIStuff/yolov8n.onnx",        // Relative: build/../AIStuff
+        "../../AIStuff/yolov8n.onnx",     // Relative: build/Release/../../AIStuff
+    };
+    
+    std::vector<std::string> classNamesPaths = {
+        "AIStuff/coco.names",
+        "../AIStuff/coco.names",
+        "../../AIStuff/coco.names",
+    };
+    
+    bool modelLoaded = false;
+    for (size_t i = 0; i < modelPaths.size(); i++)
+    {
+        if (LoadModel(modelPaths[i], classNamesPaths[i]))
+        {
+            modelLoaded = true;
+            break;
+        }
+    }
+    
+    if (!modelLoaded)
+    {
+        wprintf(L"[WARNING] Khong the tai model YOLO. Livestream se khong deem nguoi!\n");
+    }
+
     wprintf(L"\n[*] Dang quet cac thiet bi camera USB...\n\n");
 
     // Liệt kê tất cả camera

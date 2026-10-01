@@ -87,3 +87,5 @@ __pycache__/
 *.mov
 *.mkv
 captured_frame.jpg
+# Ultralytics YOLO output
+runs/
